@@ -1,0 +1,574 @@
+---
+title: "Cotton Strip Decomposition Analysis"
+author: "Chelsea Little"
+date: "05/11/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# various packages needed
+library(tidyverse)
+library(textshape)
+library(ggfortify)
+# library(knitr)
+library(ggplot2)
+library(lme4)
+library(MuMIn)
+library(lmerTest)
+library(vegan)
+library(lavaan)
+library(psych)
+library(tidySEM)
+library(gridExtra)
+
+```
+
+## Load and Format Data 
+
+```{r set-path}
+
+# edit to your own path name
+# data.path <-  some data path
+```
+
+
+```{r load-data}
+
+combined_data_june <- read.csv(paste(data.path, 
+                                     "combined_data_june.csv",
+                             sep=""), sep=",", dec=".")
+
+combined_data_august <- read.csv(paste(data.path, 
+                                     "combined_data_august.csv",
+                             sep=""), sep=",", dec=".")
+
+```
+
+```{r join-data-for-decomp-models}
+
+# first extract the variables we only measured once [in June] 
+# and make into a new dataframte
+
+global_habitat_vars <- combined_data_june %>%
+  select(Site, pool_percent, riffle_percent, Riparian_Category, Dominant_tree,
+         Dominant_shrub, Dominant_understory, Channel_morphology, pH,
+         Total.Ammonia..mg.L., Dissolved.Phosphate..ortho...mg.L.,
+         Salmon_Presence, Salmon_Stocked, Impervious_By_Site, Human_structures,
+         watershed, Impermeable_avg, Restoration_by_site_full, 
+         Restoration_by_watershed_full,
+         Restoration_by_site_habitat, Restoration_by_watershed_habitat, 
+         Riparian_Buffer_Width,
+         Rocks_avg, gravel_avg, fine_gravel_avg, sand_avg, mud_avg,
+         living_plants_avg, leaf_litter_avg, biofilm_avg, Overstory_density_percent,
+         Elevation)
+
+# this has multiple rows per site but doesn't need to
+global_habitat_vars_1x <- distinct(global_habitat_vars)
+
+# create an index variable that tells which sampling campaign the data came from
+combined_data_june$sampling_visit <- c("June")
+combined_data_august$sampling_visit <- c("August")
+
+# create dataframes with everything we measured twice
+june_unique_data <- combined_data_june %>%
+  select(Site, sampling_visit,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days, Replicate_ID,
+         Max_Load, Location, TLDD, TLND)
+aug_unique_data <- combined_data_august %>%
+  select(Site, sampling_visit,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days, Replicate_ID,
+         Max_Load, Location, TLDD, TLND)
+
+# combine the two dataframes of stuff we measured twice
+all_unique_data <- left_join(june_unique_data, aug_unique_data, by="Site")
+
+#combine this dataframe with the stuff we measured once
+van_hab_decomp <- left_join(all_unique_data, global_habitat_vars_1x, by="Site")
+
+# make the long version of this
+all_unique_data_2 <- rbind(june_unique_data, aug_unique_data)
+van_hab_decomp_long <- left_join(all_unique_data_2, global_habitat_vars_1x, by="Site")
+
+```
+
+```{r join-data-for-correlation-and-pca}
+
+# create june and august datasets that leave out tensile loss and have one row per site
+june_unique_hab <- june_unique_data %>%
+  select(Site,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days)
+june_unique_hab <- rename(june_unique_hab, june_Wetted_width_avg = Wetted_width_avg)
+june_unique_hab <- rename(june_unique_hab, june_Bankfull_width_avg = Bankfull_width_avg)
+june_unique_hab <- rename(june_unique_hab, june_Depth_weighted_avg = Depth_weighted_avg)
+june_unique_hab <- rename(june_unique_hab, 
+                          june_Velocity_weighted_avg = Velocity_weighted_avg)
+june_unique_hab <- rename(june_unique_hab, june_degree_days = degree_days)
+june_unique_hab <- rename(june_unique_hab, june_days_logged = days_logged)
+june_unique_hab_1x <- distinct(june_unique_hab)
+
+aug_unique_hab <- aug_unique_data %>%
+  select(Site,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days)
+aug_unique_hab <- rename(aug_unique_hab, aug_Wetted_width_avg = Wetted_width_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_Bankfull_width_avg = Bankfull_width_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_Depth_weighted_avg = Depth_weighted_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_Velocity_weighted_avg = Velocity_weighted_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_degree_days = degree_days)
+aug_unique_hab <- rename(aug_unique_hab, aug_days_logged = days_logged)
+global_habitat_vars_1x <- distinct(global_habitat_vars)
+aug_unique_hab_1x <- distinct(aug_unique_hab)
+
+# join those two datasets
+all_unique_hab <- left_join(june_unique_hab_1x, aug_unique_hab_1x, by="Site")
+
+# then join these to the global hab variables
+van_hab_data <- left_join(all_unique_hab, global_habitat_vars_1x, by="Site")
+van_hab_data <- van_hab_data %>%
+  filter(!is.na(Restoration_by_site_full))
+# STL02 for some reason appears twice - delete one appearance
+van_hab_data <- van_hab_data[-26,]
+
+```
+
+## Decomposition: Visualizing variation
+
+```{r decomp-by-watershed}
+
+# reorder the watersheds so they go W-E on North Shore, then Still Creek
+van_hab_decomp_long$watershed <- factor(van_hab_decomp_long$watershed , 
+                                        levels=c("EAG", "CPS", "WTM", "RGR", "MCD", 
+                                                 "BRT", "MSQ", "PRK", "GLT", "STL"))
+
+(TLDD_watershed_plot <- 
+    ggplot(data=van_hab_decomp_long, 
+           aes(x=watershed, 
+               y=TLDD))+ 
+    xlab("Watershed") + 
+    ylab ("% Tensile Strength Loss / degree day") + 
+   geom_boxplot()+ 
+   geom_point(aes(x=watershed, 
+               y=TLDD,
+               fill=Elevation, 
+               shape = Location),
+     color="black", 
+               alpha=0.75, 
+               size=4) + 
+        scale_shape_manual("Location", 
+                       labels=c("Pool","Riffle"),
+                values=c(22,24))+ 
+  theme_classic()+ 
+  theme(axis.text.x=element_text(size=12, color="black"), 
+        axis.text.y=element_text(size=12, color="black"), 
+        axis.title.x=element_text(size=14), 
+        axis.title.y=element_text(size=14), 
+        legend.text=element_text(size=12), 
+        legend.title=element_text(size=14),
+        legend.position="right"))
+
+```
+
+# Temperature and nutrients at sites
+
+```{r urbanization-elevation-link}
+
+# test for correlation between impervious surface and elevation:
+cor.test(van_hab_data$Elevation, 
+         van_hab_data$Impervious_By_Site, method=c("spearman"), alternative="t")
+
+```
+
+
+```{r lm-temp-urbanization}
+
+# make dataframe to test temperature-urbanization-restoration relationships
+temp_df <- van_hab_data %>%
+  select(Site, june_degree_days, aug_degree_days, june_days_logged, aug_days_logged,
+         Elevation, Impervious_By_Site, Restoration_by_site_full,
+         watershed)
+
+# convert this data into average temperature, 
+# in order to eliminate effect of different deployment durations
+temp_df$june_avg_temp <- temp_df$june_degree_days / temp_df$june_days_logged
+temp_df$aug_avg_temp <- temp_df$aug_degree_days / temp_df$aug_days_logged
+
+temp_df <- temp_df[,-c(2:5)]
+
+# make this long rather than wide
+temp_df <- temp_df %>%
+  pivot_longer(cols=june_avg_temp:aug_avg_temp, 
+               names_to = "sampling_time", values_to = "avg_temp")
+
+# test effect of elevation on temperature with a mixed-effects model
+temp_elev <- lmer(avg_temp ~ (1|sampling_time) + (1|watershed) + Elevation,
+                  data=temp_df)
+summary(temp_elev) # Elevation is highly significant
+anova(temp_elev)
+r.squaredGLMM(temp_elev)
+
+# extract the residuals from the Elevation model
+temp_df$resid<-resid(temp_elev)
+
+# test whether the residuals have any remaining relationship with urbanization or restoration
+temp_resid_urb <- lm(resid ~ Impervious_By_Site*Restoration_by_site_full, data=temp_df)
+summary(temp_resid_urb) # urbanization is not significant, neither is restoration
+
+```
+
+```{r temp-plot}
+
+(temp_elev_urb_plot <- 
+    ggplot(data = temp_df, 
+           aes(x = Impervious_By_Site, 
+               y = avg_temp, 
+               fill =Elevation,
+               shape = sampling_time)) + 
+    xlab("Impervious Cover (%)") + 
+    ylab ("Average Temperature") + 
+    scale_fill_gradient(guide="colourbar")+ 
+    scale_shape_manual("Sampling\nTime", 
+                       labels=c("August","June"),
+                values=c(21,23)) + 
+    geom_point(color="black", 
+               alpha=0.75, 
+               size=4) + 
+  theme_classic() + 
+  theme(axis.text.x=element_text(size=12, color="black"), 
+        axis.text.y=element_text(size=12, color="black"),
+        axis.title.x=element_text(size=14), 
+        axis.title.y=element_text(size=14), 
+        legend.text=element_text(size=12), 
+        legend.title=element_text(size=14), 
+        legend.position="right"))
+
+```
+
+
+```{r df-waterchem-urbanization}
+
+nut_df <- van_hab_data %>%
+  select(Site, Total.Ammonia..mg.L., Dissolved.Phosphate..ortho...mg.L., pH, Elevation,
+         Impervious_By_Site, Restoration_by_site_full, watershed) %>%
+  filter(complete.cases(.))
+
+```
+
+```{r ammonia-stats}
+
+# test for association between ammonia and elevatin using lmer
+ammon_elev <- lmer(Total.Ammonia..mg.L. ~ Elevation + (1|watershed), data=nut_df)
+summary(ammon_elev) # Elevation is not significant
+anova(ammon_elev)
+r.squaredGLMM(ammon_elev)
+
+# since elevation wasn't a significant factor,
+# continue with mixed-effect model based on raw ammonia values
+ammon_urb <- lmer(Total.Ammonia..mg.L. ~ 
+                    Impervious_By_Site*Restoration_by_site_full + Elevation +
+                    (1|watershed), data=nut_df)
+summary(ammon_urb) # marginally significant main effect of restoration
+anova(ammon_urb)
+r.squaredGLMM(ammon_urb)
+
+```
+
+
+```{r pH-stats}
+
+# test for association between pH and elevatin using lmer
+ph_elev <- lmer(pH ~ Elevation + (1|watershed), data=nut_df)
+summary(ph_elev) # Elevation IS significant
+anova(ph_elev)
+
+# since elevation is significant, do the same approach as for temperature, where we work on the residuals
+nut_df$resid_pH<-resid(ph_elev)
+ph_resid_urb <- lm(resid_pH ~ Impervious_By_Site*Restoration_by_site_full, data=nut_df)
+summary(ph_resid_urb) # urbanization is not significant, neither is restoration
+anova(ph_resid_urb)
+r.squaredGLMM(ph_resid_urb)
+
+```
+
+
+```{r phosphate-stats}
+
+# test for association between phosphate and elevatin using lmer
+phosph_elev <- lmer(Dissolved.Phosphate..ortho...mg.L. ~ Elevation + (1|watershed),
+                    data=nut_df)
+summary(phosph_elev) # Elevation is not significant
+anova(phosph_elev)
+r.squaredGLMM(phosph_elev)
+
+phosph_urb <- lmer(Dissolved.Phosphate..ortho...mg.L. ~ 
+                     Impervious_By_Site*Restoration_by_site_full + Elevation +
+                    (1|watershed), data=nut_df)
+summary(phosph_urb) # no significant main or interaction effects
+anova(phosph_urb)
+r.squaredGLMM(phosph_urb)
+
+```
+
+
+```{r plot-pH}
+
+(ph_elev_urb_plot <- 
+    ggplot(data=nut_df, 
+           aes(x=Impervious_By_Site, 
+               y=pH,
+               fill=Elevation)) + 
+    xlab("Impervious Cover (%)") + 
+    ylab ("pH") + 
+    scale_fill_gradient(guide="colourbar")+ 
+    geom_point(color="black", 
+               alpha=0.75, 
+               size=4, shape = 23) + 
+  theme_classic()+ 
+  theme(axis.text.x=element_text(size=12, color="black"), 
+        axis.text.y=element_text(size=12, color="black"), 
+        axis.title.x=element_text(size=14), 
+        axis.title.y=element_text(size=14), 
+        legend.text=element_text(size=12), 
+        legend.title=element_text(size=14), 
+        legend.position="right"))
+
+```
+
+# Make Figure 1
+
+```{r make-Figure-1}
+
+grid.arrange(temp_elev_urb_plot, ph_elev_urb_plot, TLDD_watershed_plot, nrow=3)
+# exported; panel labels a, b, and c added in vector illustration program
+
+```
+
+
+
+# Habitat variables and PCA
+
+```{r correlations}
+
+cor_habitat <- cor(van_hab_data[,c(2:5,7:11,13:14,21:23,26,35:43)], 
+                        method = "spearman", use = "pairwise.complete.obs")
+
+# to generate p-values, need to run them individually
+
+# correlation between variables that were measured twice
+cor.test(van_hab_data$june_Depth_weighted_avg, 
+         van_hab_data$aug_Depth_weighted_avg, method=c("spearman"), alternative="g")
+cor.test(van_hab_data$june_Wetted_width_avg, 
+         van_hab_data$aug_Wetted_width_avg, method=c("spearman"), alternative="g")
+cor.test(van_hab_data$june_Velocity_weighted_avg, 
+         van_hab_data$aug_Velocity_weighted_avg, method=c("spearman"), alternative="g")
+cor.test(van_hab_data$june_degree_days, 
+         van_hab_data$aug_degree_days, method=c("spearman"), alternative="g")
+
+# correlation between pairs of variables measured once
+cor.test(van_hab_data$june_Wetted_width_avg, 
+         van_hab_data$june_Bankfull_width_avg, method=c("spearman"), alternative="t")
+cor.test(van_hab_data$Elevation, 
+         van_hab_data$june_degree_days, method=c("spearman"), alternative="t")
+cor.test(van_hab_data$Elevation, 
+         van_hab_data$aug_degree_days, method=c("spearman"), alternative="t")
+
+```
+
+```{r first-PCA-without-water-chem}
+
+habitat_data_PCA <- van_hab_data %>% column_to_rownames("Site")
+
+df_for_pca1 <- habitat_data_PCA[,c(1,3:4,13,34:42)] 
+df_for_pca1 <- scale(df_for_pca1)
+
+habitat_pca <- princomp(df_for_pca1, cor=FALSE)
+
+summary(habitat_pca)
+
+loadings(habitat_pca)
+
+# for future things, save this as a dataframe
+PCA1_scores <- as.data.frame(habitat_pca$scores)
+PCA1_scores <- rownames_to_column(PCA1_scores, var = "Site")
+
+```
+
+```{r make-Figure-2}
+
+theme_set(theme_classic())
+
+# define breaks for color scale
+my_breaks = c(1,2,4,8,16,32)
+
+(pca_plot_habitat_2 <- 
+    autoplot(habitat_pca, data=habitat_data_PCA, fill = "Impervious_By_Site", 
+             label=FALSE, loadings=TRUE, loadings.label=TRUE,loadings.colour="black", 
+             loadings.label.colour="black", shape=21, size = 5)+
+    scale_fill_viridis_c("% Impervious Surface", guide="colourbar"))
+
+# Note - variable names are replaced in vector software with non-abbreviated names
+# Data location, color, etc are not edited, just names
+
+```
+
+
+
+```{r second-PCA-with-water-chemistry}
+
+# for the supplement - do a PCA with pH in it
+
+waterchem_rows_subset <- van_hab_data[!is.na(van_hab_data$pH),]
+
+waterchem_rows_subset <- waterchem_rows_subset %>% column_to_rownames("Site")
+
+df_for_pca2 <- waterchem_rows_subset[,c(1,3,4,13,20,32:40)] 
+df_for_pca2 <- df_for_pca2[!is.na(df_for_pca2$pH),]
+df_for_pca2 <- scale(df_for_pca2)
+
+waterchem_pca <- princomp(df_for_pca2, cor=FALSE)
+
+summary(waterchem_pca)
+
+loadings(waterchem_pca)
+
+```
+
+```{r PCA-plot-with-pH}
+
+(pca_plot_waterchem_2 <- 
+    autoplot(waterchem_pca, data=waterchem_rows_subset, fill = "Impervious_By_Site", 
+             label=FALSE, loadings=TRUE, loadings.label=TRUE,loadings.colour="black", 
+             loadings.label.colour="black", shape=21, size = 5)+
+    scale_fill_viridis_c("% Impervious Surface", guide="colourbar"))
+
+```
+
+## Decomposition rates: SEM approach
+
+```{r make-scaled-dataset-for-SEM}
+
+# the data have to be scaled so that the mean is zero and variance is one,
+# otherwise it is not possible to compare the weights through the various paths in the SEM
+
+# make a new dataset
+van_hab_decomp_long_scaled <- van_hab_decomp_long
+
+# scale some things
+van_hab_decomp_long_scaled$TLDD <- scale(van_hab_decomp_long_scaled$TLDD, TRUE, TRUE)
+van_hab_decomp_long_scaled$Impervious_By_Site <-
+  scale(van_hab_decomp_long_scaled$Impervious_By_Site, TRUE, TRUE)
+van_hab_decomp_long_scaled$Restoration_by_site <- 
+  scale(van_hab_decomp_long_scaled$Restoration_by_site_full, TRUE, TRUE)
+van_hab_decomp_long_scaled$Restoration_by_site_habitat<- 
+  scale(van_hab_decomp_long_scaled$Restoration_by_site_habitat , TRUE, TRUE)
+van_hab_decomp_long_scaled$Elevation  <- scale(van_hab_decomp_long_scaled$Elevation , TRUE, TRUE)
+van_hab_decomp_long_scaled$Dissolved.Phosphate..ortho...mg.L.  <-
+  scale(van_hab_decomp_long_scaled$Dissolved.Phosphate..ortho...mg.L. , TRUE, TRUE)
+van_hab_decomp_long_scaled$degree_days  <- scale(van_hab_decomp_long_scaled$degree_days , TRUE, TRUE)
+van_hab_decomp_long_scaled$Total.Ammonia..mg.L.  <-
+  scale(van_hab_decomp_long_scaled$Total.Ammonia..mg.L. , TRUE, TRUE)
+
+# make a dummy variable for sampling visit
+van_hab_decomp_long_scaled <- cbind(van_hab_decomp_long_scaled, 
+                                    dummy.code(van_hab_decomp_long_scaled$sampling_visit))
+# make a dummy variable for riffle/pool
+van_hab_decomp_long_scaled <- cbind(van_hab_decomp_long_scaled,
+                                    dummy.code(van_hab_decomp_long_scaled$Location))
+
+# add PCA scores to dataframe
+van_hab_decomp_long_scaled <- left_join(van_hab_decomp_long_scaled, PCA1_scores, by="Site")
+van_hab_decomp_long_scaled$Comp.1  <- scale(van_hab_decomp_long_scaled$Comp.1 , TRUE, TRUE)
+van_hab_decomp_long_scaled$Comp.2  <- scale(van_hab_decomp_long_scaled$Comp.2 , TRUE, TRUE)
+
+```
+
+```{r lavaan-model}
+
+# new model structure
+mod.3.SEM <- 'Impervious_By_Site ~  Elevation
+Restoration_by_site ~ Impervious_By_Site + Elevation
+Comp.1 ~ Elevation + Impervious_By_Site + Restoration_by_site
+Comp.2 ~ Elevation + Impervious_By_Site + Restoration_by_site
+TLDD ~ Impervious_By_Site + Restoration_by_site + Elevation + Comp.1 + Comp.2 + August + R'
+
+mod.3.results <- sem(mod.3.SEM, van_hab_decomp_long_scaled)
+
+summary(mod.3.results, standardized=TRUE) # used 244 observations
+parameterEstimates(mod.3.results, standardized = TRUE)
+fitMeasures(mod.3.results, c("chisq", "pvalue", "rmsea", "rmsea.pvalue", "cfi", "srmr")) 
+# fits okay by CFI and SRMR, less well through Chi-Squared and RMSEA
+# this is probably good enough to use
+
+```
+
+```{r make-Figure-3}
+
+# define the layout for the SEM plot
+lay2 <- get_layout(NA, NA, "Elevation", NA, NA,
+  "Impervious_By_Site", NA, NA, NA,  "Restoration_by_site",
+                   "Comp.1", NA, NA, NA, "Comp.2",
+                   NA, NA, "TLDD", NA, NA,
+                   NA, "August", NA, "R", NA,
+                   rows=5)
+
+# now try to define the graph output and adjust some things
+sem_graph_output2 <- prepare_graph(model = mod.3.results, layout = lay2) %>%
+  edit_graph({label_location = .25}) %>% # make it so labels don't overlap each other
+  linetype_pos_edges(1) %>% # positive paths are solid lines
+  linetype_neg_edges(2) %>% # negative paths are dashed lines
+  alpha_nonsig_edges(0.4) %>% # non-significant paths are grayed out (alpha is transparency)
+  hide_var() %>% # hide the variance of each variable
+  plot()
+
+sem_graph_output2
+# note: fixed the variable names up a bit in a vector editing program 
+```
+
+```{r lavaan-model-with-habitat-restoration}
+
+# for the supplement, make a model with only the "restoration effort" that involved habitat
+
+# new model structure
+mod.3h.SEM <- 'Impervious_By_Site ~  Elevation
+Restoration_by_site_habitat ~ Impervious_By_Site + Elevation
+Comp.1 ~ Elevation + Impervious_By_Site + Restoration_by_site_habitat
+Comp.2 ~ Elevation + Impervious_By_Site + Restoration_by_site_habitat
+TLDD ~ Impervious_By_Site + Restoration_by_site_habitat + Elevation + Comp.1 + Comp.2 + August + R'
+
+mod.3h.results <- sem(mod.3h.SEM, van_hab_decomp_long_scaled)
+
+summary(mod.3h.results, standardized=TRUE) # used 244 observations
+parameterEstimates(mod.3h.results, standardized = TRUE)
+fitMeasures(mod.3h.results, c("chisq", "pvalue", "rmsea", "rmsea.pvalue", "cfi", "srmr")) 
+# fits okay by CFI and SRMR, less well through Chi-Squared and RMSEA
+# this is probably good enough to use
+
+```
+
+```{r make-SEM-plot-2}
+
+# define the layout for the SEM plot
+lay2 <- get_layout(NA, NA, "Elevation", NA, NA,
+  "Impervious_By_Site", NA, NA, NA,  "Restoration_by_site_habitat",
+                   "Comp.1", NA, NA, NA, "Comp.2",
+                   NA, NA, "TLDD", NA, NA,
+                   NA, "August", NA, "R", NA,
+                   rows=5)
+
+# now try to define the graph output and adjust some things
+sem_graph_output2h <- prepare_graph(model = mod.3h.results, layout = lay2) %>%
+  edit_graph({label_location = .25}) %>% # make it so labels don't overlap each other
+  linetype_pos_edges(1) %>% # positive paths are solid lines
+  linetype_neg_edges(2) %>% # negative paths are dashed lines
+  alpha_nonsig_edges(0.4) %>% # non-significant paths are grayed out (alpha is transparency)
+  hide_var() %>% # hide the variance of each variable
+  plot()
+
+sem_graph_output2h
+```
