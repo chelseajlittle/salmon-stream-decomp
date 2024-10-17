@@ -1,0 +1,1201 @@
+---
+title: "Cotton Strip Decomposition Analysis"
+author: "Chelsea Little & Amanda Wik"
+date: "09/25/2024"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Setup for the analysis
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#rm(list = ls())
+
+# various packages needed
+library(tidyverse)
+library(textshape)
+library(ggfortify)
+# library(knitr)
+library(ggplot2)
+library(lme4)
+library(MuMIn)
+library(lmerTest)
+library(vegan)
+library(lavaan)
+library(psych)
+library(OpenMx)
+library(bayesplot)
+library(igraph)
+library(tidySEM)
+library(gridExtra)
+library(piecewiseSEM)
+library(DHARMa)
+library(glmmTMB)
+
+```
+
+## Load and Format Data 
+
+```{r set-path, include=FALSE}
+
+# edit to your own path name
+data.path <- here("Downloads","Oct_analysis" )
+```
+
+```{r load-data, include=FALSE}
+
+combined_data_june <- read.csv(paste(data.path, 
+                                     "/combined_data_june_oct2024.csv",
+                             sep=""), sep=",", dec=".")
+
+combined_data_august <- read.csv(paste(data.path, 
+                                     "/combined_data_august.csv",
+                             sep=""), sep=",", dec=".")
+
+```
+
+```{r join-data-for-decomp-models, include=FALSE}
+
+# first extract the variables we only measured once [in June] 
+# and make into a new dataframte
+
+global_habitat_vars <- combined_data_june %>%
+  select(Site, pool_percent, riffle_percent, Riparian_Category, Dominant_tree,
+         Dominant_shrub, Dominant_understory, Channel_morphology, pH,
+         Total.Ammonia..mg.L., Dissolved.Phosphate..ortho...mg.L.,
+         Impervious_By_Site, Human_structures,
+         watershed, Impermeable_avg, Restoration_Effort_by_site_full, 
+         Restoration_Effort_by_watershed_full,
+         Restoration_Effort_by_site_habitat, Restoration_Effort_by_watershed_habitat,
+         Restoration_Intensity_by_site, Restoration_Intensity_by_watershed,
+         Riparian_Buffer_Width,
+         Rocks_avg, gravel_avg, fine_gravel_avg, sand_avg, mud_avg,
+         living_plants_avg, leaf_litter_avg, biofilm_avg, Overstory_density_percent,
+         Elevation)
+
+# this has multiple rows per site but doesn't need to
+global_habitat_vars_1x <- distinct(global_habitat_vars)
+
+# create an index variable that tells which sampling campaign the data came from
+combined_data_june$sampling_visit <- c("June")
+combined_data_august$sampling_visit <- c("August")
+
+# create dataframes with everything we measured twice
+june_unique_data <- combined_data_june %>%
+  select(Site, sampling_visit,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days, Replicate_ID,
+         Max_Load, Location, TLDD, TLND)
+aug_unique_data <- combined_data_august %>%
+  select(Site, sampling_visit,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days, Replicate_ID,
+         Max_Load, Location, TLDD, TLND)
+
+# combine the two dataframes of stuff we measured twice
+all_unique_data <- left_join(june_unique_data, aug_unique_data, by="Site")
+
+#combine this dataframe with the stuff we measured once
+van_hab_decomp <- left_join(all_unique_data, global_habitat_vars_1x, by="Site")
+
+# make the long version of this
+all_unique_data_2 <- rbind(june_unique_data, aug_unique_data)
+van_hab_decomp_long <- left_join(all_unique_data_2, global_habitat_vars_1x, by="Site")
+
+```
+
+```{r join-data-for-correlation-and-pca, include=FALSE}
+
+# create june and august datasets that leave out tensile loss and have one row per site
+june_unique_hab <- june_unique_data %>%
+  select(Site,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days)
+june_unique_hab <- rename(june_unique_hab, june_Wetted_width_avg = Wetted_width_avg)
+june_unique_hab <- rename(june_unique_hab, june_Bankfull_width_avg = Bankfull_width_avg)
+june_unique_hab <- rename(june_unique_hab, june_Depth_weighted_avg = Depth_weighted_avg)
+june_unique_hab <- rename(june_unique_hab, 
+                          june_Velocity_weighted_avg = Velocity_weighted_avg)
+june_unique_hab <- rename(june_unique_hab, june_degree_days = degree_days)
+june_unique_hab <- rename(june_unique_hab, june_days_logged = days_logged)
+june_unique_hab_1x <- distinct(june_unique_hab)
+
+aug_unique_hab <- aug_unique_data %>%
+  select(Site,
+         Wetted_width_avg, Bankfull_width_avg, Depth_weighted_avg,
+         Velocity_weighted_avg, days_logged, degree_days)
+aug_unique_hab <- rename(aug_unique_hab, aug_Wetted_width_avg = Wetted_width_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_Bankfull_width_avg = Bankfull_width_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_Depth_weighted_avg = Depth_weighted_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_Velocity_weighted_avg = Velocity_weighted_avg)
+aug_unique_hab <- rename(aug_unique_hab, aug_degree_days = degree_days)
+aug_unique_hab <- rename(aug_unique_hab, aug_days_logged = days_logged)
+global_habitat_vars_1x <- distinct(global_habitat_vars)
+aug_unique_hab_1x <- distinct(aug_unique_hab)
+
+# join those two datasets
+all_unique_hab <- left_join(june_unique_hab_1x, aug_unique_hab_1x, by="Site")
+
+# then join these to the global hab variables
+van_hab_data <- left_join(all_unique_hab, global_habitat_vars_1x, by="Site")
+
+```
+
+# Data exploration and Figure 1
+
+## Decomposition: Visualizing variation
+
+This will be panel c of Figure 1:
+
+```{r decomp-by-watershed-plot, echo=FALSE}
+
+# reorder the watersheds so they go W-E on North Shore, then Still Creek
+van_hab_decomp_long$watershed <- factor(van_hab_decomp_long$watershed , 
+                                        levels=c("EAG", "CPS", "WTM", "RGR", "MCD", 
+                                                 "BRT", "MSQ", "PRK", "GLT", "STL"))
+
+(TLDD_watershed_plot <- 
+    ggplot(data=van_hab_decomp_long, 
+           aes(x=watershed, 
+               y=TLDD))+ 
+    xlab("Watershed") + 
+    ylab ("% Tensile Strength Loss / degree day") + 
+   geom_boxplot()+ 
+   geom_point(aes(x=watershed, 
+               y=TLDD,
+               fill=Elevation, 
+               shape = Location),
+     color="black", 
+               alpha=0.75, 
+               size=4) + 
+        scale_shape_manual("Location", 
+                       labels=c("Pool","Riffle"),
+                values=c(22,24))+ 
+  theme_classic()+ 
+  theme(axis.text.x=element_text(size=12, color="black"), 
+        axis.text.y=element_text(size=12, color="black"), 
+        axis.title.x=element_text(size=14), 
+        axis.title.y=element_text(size=14), 
+        legend.text=element_text(size=12), 
+        legend.title=element_text(size=14),
+        legend.position="right"))
+
+```
+
+## Temperature variation and its effects
+
+```{r urbanization-elevation-link, echo=FALSE}
+
+# test for correlation between impervious surface and elevation:
+cor.test(van_hab_data$Elevation, 
+         van_hab_data$Impervious_By_Site, method=c("spearman"), alternative="t")
+
+```
+We make linear models using our different restoration metrics. First restoration effort:
+
+```{r lm-temp-urbanization-rest-effort, echo=FALSE}
+
+# make dataframe to test temperature-urbanization-restoration relationships
+temp_df <- van_hab_data %>%
+  select(Site, june_degree_days, aug_degree_days, june_days_logged, aug_days_logged,
+         Elevation, Impervious_By_Site, Restoration_Effort_by_site_full,
+         watershed)
+
+# convert this data into average temperature, 
+# in order to eliminate effect of different deployment durations
+temp_df$june_avg_temp <- temp_df$june_degree_days / temp_df$june_days_logged
+temp_df$aug_avg_temp <- temp_df$aug_degree_days / temp_df$aug_days_logged
+
+temp_df <- temp_df[,-c(2:5)]
+
+# make this long rather than wide
+temp_df <- temp_df %>%
+  pivot_longer(cols=june_avg_temp:aug_avg_temp, 
+               names_to = "sampling_time", values_to = "avg_temp")
+
+# test effect of elevation on temperature with a mixed-effects model
+temp_elev <- lmer(avg_temp ~ (1|sampling_time) + (1|watershed) + Elevation,
+                  data=temp_df)
+summary(temp_elev) # Elevation is highly significant
+anova(temp_elev)
+r.squaredGLMM(temp_elev)
+
+# extract the residuals from the Elevation model
+temp_df$resid<-resid(temp_elev)
+
+# test whether the residuals have any remaining relationship with urbanization or restoration
+temp_resid_urb <- lm(resid ~ Impervious_By_Site*Restoration_Effort_by_site_full, data=temp_df)
+summary(temp_resid_urb) # urbanization is not significant, neither is restoration
+
+```
+
+Then restoration intensity:
+
+```{r lm-temp-urbanization-rest-intensity, echo=FALSE}
+
+# make dataframe to test temperature-urbanization-restoration relationships
+temp_df_2 <- van_hab_data %>%
+  select(Site, june_degree_days, aug_degree_days, june_days_logged, aug_days_logged,
+         Elevation, Impervious_By_Site, Restoration_Intensity_by_site,
+         watershed)
+
+# convert this data into average temperature, 
+# in order to eliminate effect of different deployment durations
+temp_df_2$june_avg_temp <- temp_df_2$june_degree_days / temp_df_2$june_days_logged
+temp_df_2$aug_avg_temp <- temp_df_2$aug_degree_days / temp_df_2$aug_days_logged
+
+temp_df_2 <- temp_df_2[,-c(2:5)]
+
+# make this long rather than wide
+temp_df_2 <- temp_df_2 %>%
+  pivot_longer(cols=june_avg_temp:aug_avg_temp, 
+               names_to = "sampling_time", values_to = "avg_temp")
+
+# add the residuals to the dataframe
+temp_resid_df <- temp_df[,c(7,8)]
+temp_df_2 <- left_join(temp_df_2, temp_resid_df, by="avg_temp")
+
+# test whether the residuals have any remaining relationship with urbanization or restoration
+temp_resid_urb_2 <- lm(resid ~ Impervious_By_Site*Restoration_Intensity_by_site, data=temp_df_2)
+summary(temp_resid_urb_2) # urbanization is not significant, neither is restoration
+
+```
+
+Panel A of figure 1 is about the relationship of elevation, temperature, and urbanization:
+
+```{r temp-plot, echo=FALSE}
+
+(temp_elev_urb_plot <- 
+    ggplot(data = temp_df, 
+           aes(x = Impervious_By_Site, 
+               y = avg_temp, 
+               fill =Elevation)) + 
+    xlab("Impervious Cover (%)") + 
+    ylab ("Average Temperature") + 
+    scale_fill_gradient(guide="colourbar")+ 
+    scale_shape_manual("Sampling\nTime", 
+                       labels=c("August","June"),
+                values=c(21,23)) + 
+    geom_point(color="black", 
+               alpha=0.75, 
+               size=4, shape=21) + 
+  theme_classic() + 
+  theme(axis.text.x=element_text(size=12, color="black"), 
+        axis.text.y=element_text(size=12, color="black"),
+        axis.title.x=element_text(size=14), 
+        axis.title.y=element_text(size=14), 
+        legend.text=element_text(size=12), 
+        legend.title=element_text(size=14), 
+        legend.position="right"))
+
+```
+
+## Looking at water chemistry data
+
+```{r df-waterchem-urbanization, include=FALSE}
+
+nut_df <- van_hab_data %>%
+  select(Site, Total.Ammonia..mg.L., Dissolved.Phosphate..ortho...mg.L., pH, Elevation,
+         Impervious_By_Site, Restoration_Effort_by_site_full, 
+         Restoration_Effort_by_watershed_full,
+         Restoration_Intensity_by_site, Restoration_Intensity_by_watershed,
+         watershed) %>%
+  filter(complete.cases(.))
+
+```
+
+Make some models about effect of ammonia:
+
+```{r ammonia-stats, echo=FALSE}
+
+# test for association between ammonia and elevation using lmer
+ammon_elev <- lmer(Total.Ammonia..mg.L. ~ Elevation + (1|watershed), data=nut_df)
+summary(ammon_elev) # Elevation is not significant
+anova(ammon_elev)
+r.squaredGLMM(ammon_elev)
+
+# since elevation wasn't a significant factor,
+# continue with mixed-effect model based on raw ammonia values
+ammon_urb <- lmer(Total.Ammonia..mg.L. ~ 
+                    Impervious_By_Site*Restoration_Effort_by_site_full + Elevation +
+                    (1|watershed), data=nut_df)
+summary(ammon_urb) # marginally significant main effect of restoration
+anova(ammon_urb)
+r.squaredGLMM(ammon_urb)
+
+# repeat this for restoration intensity
+ammon_urb_2 <- lmer(Total.Ammonia..mg.L. ~ 
+                    Impervious_By_Site*Restoration_Intensity_by_site + Elevation +
+                    (1|watershed), data=nut_df)
+summary(ammon_urb_2) # marginally significant main effect of restoration
+anova(ammon_urb_2)
+r.squaredGLMM(ammon_urb_2)
+
+```
+
+Make some models about the effect of pH:
+
+```{r pH-stats, echo=FALSE}
+
+# test for association between pH and elevatin using lmer
+ph_elev <- lmer(pH ~ Elevation + (1|watershed), data=nut_df)
+summary(ph_elev) # Elevation IS significant
+anova(ph_elev)
+
+# since elevation is significant, do the same approach as for temperature, where we work on the residuals
+nut_df$resid_pH<-resid(ph_elev)
+
+# residual model with restoration effort
+ph_resid_urb <- lm(resid_pH ~ Impervious_By_Site*Restoration_Effort_by_site_full,
+                   data=nut_df)
+summary(ph_resid_urb) # urbanization is not significant, neither is restoration
+anova(ph_resid_urb)
+r.squaredGLMM(ph_resid_urb)
+
+ph_resid_urb_2 <- lm(resid_pH ~ Impervious_By_Site*Restoration_Intensity_by_site,
+                     data=nut_df)
+summary(ph_resid_urb_2) # urbanization is not significant, neither is restoration
+anova(ph_resid_urb_2)
+r.squaredGLMM(ph_resid_urb_2)
+
+```
+
+Make some models about the effect of phosphate:
+
+```{r phosphate-stats, echo=FALSE}
+
+# test for association between phosphate and elevatin using lmer
+phosph_elev <- lmer(Dissolved.Phosphate..ortho...mg.L. ~ Elevation + (1|watershed),
+                    data=nut_df)
+summary(phosph_elev) # Elevation is not significant
+anova(phosph_elev)
+r.squaredGLMM(phosph_elev)
+
+phosph_urb <- lmer(Dissolved.Phosphate..ortho...mg.L. ~ 
+                     Impervious_By_Site*Restoration_Effort_by_site_full + Elevation +
+                    (1|watershed), data=nut_df)
+summary(phosph_urb) # no significant main or interaction effects
+anova(phosph_urb)
+r.squaredGLMM(phosph_urb)
+
+```
+
+Panel b of Figure 1 will be about pH:
+
+```{r plot-pH, echo=FALSE}
+
+(ph_elev_urb_plot <- 
+    ggplot(data=nut_df, 
+           aes(x=Impervious_By_Site, 
+               y=pH,
+               fill=Elevation)) + 
+    xlab("Impervious Cover (%)") + 
+    ylab ("pH") + 
+    scale_fill_gradient(guide="colourbar")+ 
+    geom_point(color="black", 
+               alpha=0.75, 
+               size=4, shape = 21) + 
+  theme_classic()+ 
+  theme(axis.text.x=element_text(size=12, color="black"), 
+        axis.text.y=element_text(size=12, color="black"), 
+        axis.title.x=element_text(size=14), 
+        axis.title.y=element_text(size=14), 
+        legend.text=element_text(size=12), 
+        legend.title=element_text(size=14), 
+        legend.position="right"))
+
+```
+
+## Make Figure 1
+
+To make Figure 1 we need to just join the panels we have already made:
+
+```{r make-Figure-1, echo=FALSE}
+
+grid.arrange(temp_elev_urb_plot, ph_elev_urb_plot, TLDD_watershed_plot, nrow=3)
+# exported; panel labels a, b, and c added in vector illustration program
+
+```
+
+# Exploration of habitat variables using PCA (Figure 2)
+
+```{r correlations, include=FALSE}
+
+cor_habitat <- cor(van_hab_data[,c(2:5,7:11,13:14,21:23,24,35:43)], 
+                        method = "spearman", use = "pairwise.complete.obs")
+
+# to generate p-values, need to run them individually
+
+# correlation between variables that were measured twice
+cor.test(van_hab_data$june_Depth_weighted_avg, 
+         van_hab_data$aug_Depth_weighted_avg, method=c("spearman"), alternative="g")
+cor.test(van_hab_data$june_Wetted_width_avg, 
+         van_hab_data$aug_Wetted_width_avg, method=c("spearman"), alternative="g")
+cor.test(van_hab_data$june_Velocity_weighted_avg, 
+         van_hab_data$aug_Velocity_weighted_avg, method=c("spearman"), alternative="g")
+cor.test(van_hab_data$june_degree_days, 
+         van_hab_data$aug_degree_days, method=c("spearman"), alternative="g")
+
+# correlation between pairs of variables measured once
+cor.test(van_hab_data$june_Wetted_width_avg, 
+         van_hab_data$june_Bankfull_width_avg, method=c("spearman"), alternative="t")
+cor.test(van_hab_data$Elevation, 
+         van_hab_data$june_degree_days, method=c("spearman"), alternative="t")
+cor.test(van_hab_data$Elevation, 
+         van_hab_data$aug_degree_days, method=c("spearman"), alternative="t")
+
+```
+
+First we do a PCA with all sites, but no water chemistry data.
+
+```{r first-PCA-without-water-chem, echo=FALSE}
+
+habitat_data_PCA <- van_hab_data %>% column_to_rownames("Site")
+
+df_for_pca1 <- habitat_data_PCA[,c(1,3:4,13,34:42)] 
+df_for_pca1 <- scale(df_for_pca1)
+
+habitat_pca <- princomp(df_for_pca1, cor=FALSE)
+
+summary(habitat_pca)
+
+loadings(habitat_pca)
+
+# for future things, save this as a dataframe
+PCA1_scores <- as.data.frame(habitat_pca$scores)
+PCA1_scores <- rownames_to_column(PCA1_scores, var = "Site")
+
+```
+
+Figure 2:
+
+```{r make-Figure-2, echo=FALSE}
+
+theme_set(theme_classic())
+
+# define breaks for color scale
+my_breaks = c(1,2,4,8,16,32)
+
+(pca_plot_habitat_2 <- 
+    autoplot(habitat_pca, data=habitat_data_PCA, fill = "Impervious_By_Site", 
+             label=FALSE, loadings=TRUE, loadings.label=TRUE,loadings.colour="black", 
+             loadings.label.colour="black", shape=21, size = 5)+
+    scale_fill_viridis_c("% Impervious Surface", guide="colourbar"))
+
+# Note - variable names are replaced in vector software with non-abbreviated names
+# Data location, color, etc are not edited, just names
+
+```
+
+Second we do another PCA with water chemistry data, but this means limited sites.
+
+```{r second-PCA-with-water-chemistry, echo=FALSE}
+
+# for the supplement - do a PCA with pH in it
+
+waterchem_rows_subset <- van_hab_data[!is.na(van_hab_data$pH),]
+
+waterchem_rows_subset <- waterchem_rows_subset %>% column_to_rownames("Site")
+
+df_for_pca2 <- waterchem_rows_subset[,c(c(1,3:4,13,20,34:42))] 
+df_for_pca2 <- df_for_pca2[!is.na(df_for_pca2$pH),]
+df_for_pca2 <- scale(df_for_pca2)
+
+waterchem_pca <- princomp(df_for_pca2, cor=FALSE)
+
+summary(waterchem_pca)
+
+loadings(waterchem_pca)
+
+```
+
+Other PCA (will go in supplement):
+
+```{r PCA-plot-with-pH, echo=FALSE}
+
+(pca_plot_waterchem_2 <- 
+    autoplot(waterchem_pca, data=waterchem_rows_subset, fill = "Impervious_By_Site", 
+             label=FALSE, loadings=TRUE, loadings.label=TRUE,loadings.colour="black", 
+             loadings.label.colour="black", shape=21, size = 5)+
+    scale_fill_viridis_c("% Impervious Surface", guide="colourbar"))
+
+```
+
+# Structural equation modeling approach & Figure 3
+
+```{r make-scaled-dataset-for-SEM, include=FALSE}
+
+# add PCA scores to dataframe
+van_hab_decomp_long <- left_join(van_hab_decomp_long, PCA1_scores,
+                                        by="Site")
+
+# the data have to be scaled so that the mean is zero and variance is one,
+# otherwise it is not possible to compare the weights through the various paths in the SEM
+
+# make a new dataset
+van_hab_decomp_long_scaled <- van_hab_decomp_long
+
+# scale some things
+van_hab_decomp_long_scaled$TLDD <- as.vector(scale(van_hab_decomp_long_scaled$TLDD, TRUE, TRUE))
+
+van_hab_decomp_long_scaled$Impervious_By_Site <-
+  as.vector(scale(van_hab_decomp_long_scaled$Impervious_By_Site, TRUE, TRUE))
+
+van_hab_decomp_long_scaled$Restoration_Effort_by_site_full <- 
+  as.vector(scale(van_hab_decomp_long_scaled$Restoration_Effort_by_site_full, 
+                  TRUE, TRUE))
+van_hab_decomp_long_scaled$Restoration_Effort_by_site_habitat<- 
+  as.vector(scale(van_hab_decomp_long_scaled$Restoration_Effort_by_site_habitat ,
+                  TRUE, TRUE))
+van_hab_decomp_long_scaled$Restoration_Intensity_by_site <- 
+  as.vector(scale(van_hab_decomp_long_scaled$Restoration_Intensity_by_site, 
+                  TRUE, TRUE))
+van_hab_decomp_long_scaled$Elevation  <- 
+  as.vector(scale(van_hab_decomp_long_scaled$Elevation , TRUE, TRUE))
+van_hab_decomp_long_scaled$Dissolved.Phosphate..ortho...mg.L.  <-
+  as.vector(scale(van_hab_decomp_long_scaled$Dissolved.Phosphate..ortho...mg.L. ,
+                  TRUE, TRUE))
+van_hab_decomp_long_scaled$degree_days  <- 
+  as.vector(scale(van_hab_decomp_long_scaled$degree_days , TRUE, TRUE))
+van_hab_decomp_long_scaled$Total.Ammonia..mg.L.  <-
+  as.vector(scale(van_hab_decomp_long_scaled$Total.Ammonia..mg.L. , TRUE, TRUE))
+van_hab_decomp_long_scaled$Comp.1  <- 
+  as.vector(scale(van_hab_decomp_long_scaled$Comp.1 , TRUE, TRUE))
+van_hab_decomp_long_scaled$Comp.2  <- 
+  as.vector(scale(van_hab_decomp_long_scaled$Comp.2 , TRUE, TRUE))
+
+
+# make a dummy variable for sampling visit
+van_hab_decomp_long_scaled <- cbind(van_hab_decomp_long_scaled, 
+                              dummy.code(van_hab_decomp_long_scaled$sampling_visit))
+
+# make a dummy variable for riffle/pool
+van_hab_decomp_long_scaled <- cbind(van_hab_decomp_long_scaled,
+                                    dummy.code(van_hab_decomp_long_scaled$Location))
+
+```
+
+This is the model we eventually landed on - see below under "supplemental methods" for how we got here.
+
+```{r piecewiseSEM-reduced, echo=FALSE}
+
+# this has removed some paths from above
+
+mod_3_pSEM <- psem(
+  
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.1 ~ Elevation + Restoration_Intensity_by_site + (1|watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + R + (1 | Site), 
+          data = van_hab_decomp_long_scaled)
+)
+
+# coefs(mod_2_pSEM)
+
+# basisSet(mod_2_pSEM)
+
+# dSep(mod_2_pSEM, .progressBar = FALSE)
+
+summary(mod_3_pSEM)
+
+```
+
+We finally can have some tests of directed separation. But it is still giving the same convergence warning.
+
+This last model does have a better AIC than any of the other models that we tested using the scaled dataset (AIC comparisons can only be made among models using the same dataset, so we can't compare to the non-scaled models). However, the R2 values for the component models are nearly identical, so this is just because it is more parsimonious (fewer variables), not because it explains the data much better.
+
+We should still test the residuals for assumptions. 
+
+```{r test-resids-mod3, echo=FALSE}
+
+mod3p1 <- lmer(Impervious_By_Site ~ Elevation + (1|watershed), 
+      data = van_hab_decomp_long_scaled)
+simulateResiduals(mod3p1, plot=TRUE)
+
+mod3p2 <- lmer(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled)
+simulateResiduals(mod3p2, plot=TRUE)
+  
+mod3p3 <- lmer(Comp.1 ~ Elevation + Restoration_Intensity_by_site + (1|watershed),
+      data = van_hab_decomp_long_scaled)
+simulateResiduals(mod3p3, plot=TRUE)
+  
+mod3p4 <- lmer(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + R + (1 | Site), 
+          data = van_hab_decomp_long_scaled)
+simulateResiduals(mod3p4, plot=TRUE)
+
+```
+
+None of these submodels fit particularly well, but they do fit better than some alternatives that we tried. For example, the Q-Q plots for mod3p4 are better than if we used watershed as the random factor for that model. Meanwhile for mod3p1, mod3p2, and mod3p3, using Site as the random factor leads to assumptions being violated more severely. 
+
+```{r plot-SEM-partial, include=FALSE}
+
+# The plotting in the partialSEM package is quite ugly, 
+# and it's not possible to customize the layout. Therefore, we will plot it but not include this plot.
+
+plot(mod_3_pSEM)
+
+```
+
+```{r lavaan-model, include=FALSE}
+
+# instead, we will plot the model output from lavaan and edit it to include the correct paths from partialSEM
+# because this way we can control the plot layout
+
+# first step is making the lavaan
+
+# new model structure
+mod.3.SEM <- 'Impervious_By_Site ~  Elevation
+Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation
+Comp.1 ~ Elevation + Impervious_By_Site 
+TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + R'
+
+mod.3.results <- sem(mod.3.SEM, van_hab_decomp_long_scaled)
+
+summary(mod.3.results, standardized=TRUE) # used 212 observations
+parameterEstimates(mod.3.results, standardized = TRUE)
+fitMeasures(mod.3.results, c("chisq", "pvalue", "rmsea", "rmsea.pvalue", "cfi", "srmr")) 
+# fits okay by CFI and SRMR, less well through Chi-Squared and RMSEA
+# this is probably good enough to use
+
+```
+
+```{r make-Figure-3, include=FALSE}
+
+# define the layout for the SEM plot
+lay2 <- get_layout(NA, "Elevation", NA, "Impervious_By_Site", NA,
+                   "Comp.1", NA, NA, NA, "Restoration_Intensity_by_site",
+                   NA, NA, "TLDD", NA, NA,
+                   NA, NA, "R", NA, NA,
+                   rows=4)
+
+# now try to define the graph output and adjust some things
+sem_graph_output2 <- prepare_graph(model = mod.3.results, layout = lay2) %>%
+  edit_graph({label_location = .25}) %>% # make it so labels don't overlap each other
+  linetype_pos_edges(1) %>% # positive paths are solid lines
+  linetype_neg_edges(2) %>% # negative paths are dashed lines
+  alpha_nonsig_edges(0.4) %>% # non-significant paths are grayed out (alpha is transparency)
+  hide_var() %>% # hide the variance of each variable
+  plot()
+
+sem_graph_output2
+# note: fixed the variable names up a bit in a vector editing program 
+
+### IMPORTANT! This was the structure of the SEM plot, but I replaced the coefficients with the output from piecewiseSEM and edited the dashed/solid and gray/black aspect of lines as needed. used Affinity Designer.
+
+```
+
+# Supplemental methods exploration about SEM 
+
+## Original (full) model with Piecewise SEM - assessing model fit
+
+This was our original model structure, with 
+
+TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + PCA.Comp.1 + PCA.Comp.2 + Season + Pool-Riffle:
+
+```{r piecewiseSEM-mod1, echo=FALSE}
+
+#Now for the SEM model
+
+mod_1_pSEM <- psem(
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed), 
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),        
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.1 ~ Elevation + Impervious_By_Site + Restoration_Intensity_by_site + (1 | watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.2 ~ Elevation + Impervious_By_Site + Restoration_Intensity_by_site + (1 | watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + Comp.2 + August + R + 
+         (1 | watershed), 
+      data = van_hab_decomp_long_scaled)
+)
+
+# dSep isn't really relevant because our model is more or less saturated, but:
+# basisSet(mod_1_pSEM)
+# dSep(mod_1_pSEM, .progressBar = FALSE) 
+
+summary(mod_1_pSEM)
+
+```
+
+I read the recommendation to test the fit of each of the component models. Let's do this one at a time using the DHARMa package.
+
+```{r test-resids-mod1p1, echo=FALSE}
+
+mod1p1 <- lmer(Impervious_By_Site ~ Elevation + (1 | watershed), 
+      data = van_hab_decomp_long_scaled)
+
+simulateResiduals(mod1p1, plot=TRUE)
+
+```
+
+This is a quite terrible output - our residuals deviate from the expected pattern of observed vs. expected, and the right panel suggests that maybe we don't have a linear relationship.
+
+Let's go on anyway and see if the others are just as bad.
+
+```{r test-resids-mod1p2, echo=FALSE}
+
+mod1p2 <- lmer(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),        
+       data = van_hab_decomp_long_scaled)
+
+simulateResiduals(mod1p2, plot=TRUE)
+
+```
+
+```{r test-resids-mod1p3, echo=FALSE}
+
+mod1p3 <- lmer(Comp.1 ~ Elevation + Impervious_By_Site + Restoration_Intensity_by_site + (1 | watershed),
+      data = van_hab_decomp_long_scaled)
+
+simulateResiduals(mod1p3, plot=TRUE)
+
+
+```
+
+```{r test-resids-mod1p4, echo=FALSE}
+
+mod1p4 <- lmer(Comp.2 ~ Elevation + Impervious_By_Site + Restoration_Intensity_by_site + (1 | watershed),
+      data = van_hab_decomp_long_scaled)
+
+simulateResiduals(mod1p4, plot=TRUE)
+
+
+```
+
+```{r test-resids-mod1p5, echo=FALSE}
+
+mod1p5 <-  lmer(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + Comp.2 + August + R + 
+         (1 | watershed), data=van_hab_decomp_long_scaled)
+
+simulateResiduals(mod1p5, plot=TRUE)
+
+
+```
+
+They are all pretty bad. Although the last one seems a little less bad than the others, which is interesting. 
+
+## Exploring alternative submodels to fit the data better:
+
+To fix this, let's start with the first one. Look at the relationship betwen impervious surface and elevation, it's nonlinear:
+
+```{r imp-elev-plot, echo=FALSE}
+
+(elevation_impervious_plot <- ggplot(data=van_hab_data, aes(x=Elevation, y=Impervious_By_Site)) + 
+  geom_point(color="black", fill = "gray", 
+               alpha=0.75, 
+               size=4, shape = 21) +
+   ylab("Impervious surface at site")+
+   theme_classic()+ 
+   theme(axis.text.x=element_text(size=12, color="black"), 
+         axis.text.y=element_text(size=12, color="black"), 
+         axis.title.x=element_text(size=14), 
+         axis.title.y=element_text(size=14), 
+         legend.text=element_text(size=12), 
+         legend.title=element_text(size=14)))
+
+```
+
+We could try to address this by using adding an argument to account for how the dispersion in the data varies with elevation (more dispersion at lower elevations, none at high elevations):
+
+```{r test-resids-mod1p1-dispformula, warnings=FALSE}
+
+mod1p1_disp <- glmmTMB(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+                      dispformula = ~Elevation, 
+      data = van_hab_decomp_long)
+
+simulateResiduals(mod1p1_disp, plot=TRUE)
+
+```
+
+This is a lot better! The righthand plot is still terrible, but we now do not fail the QQ plot on KS, Deviation, or Outliers.
+
+Let's see whether we can fix the other ones.
+
+Looking at restoration intensity:
+
+```{r Restoration-Intensity-plots, echo=FALSE}
+
+ggplot(data=van_hab_data, aes(x=Elevation, y=Restoration_Intensity_by_site)) + geom_point()
+
+ggplot(data=van_hab_data, aes(x=Impervious_By_Site, y=Restoration_Intensity_by_site)) + geom_point()
+
+```
+
+It has the same pattern with elevation of more dispersion with elevation. However, this response variable is an integer count, tallying up the restoration efforts. It could be considered count data, and because it is overdispersed, we could fit it with the negative binomial glm which handles overdispersion.
+
+```{r test-resids-mod1p2-neg-binom, echo=FALSE}
+
+mod1p2_nbinom <- glmmTMB(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),
+                  family="nbinom1",      
+       data = van_hab_decomp_long)
+
+simulateResiduals(mod1p2_nbinom, plot=TRUE)
+
+```
+
+Again, this is much much better! Not really on the right, but certainly on the left.
+
+Let's look at the third one - PC1. We have basically already decided to drop PC2 because we don't have a strong hypothesis about what effect it would have.
+
+```{r PC1-plots, echo=FALSE}
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Elevation, y=Comp.1)) + geom_point()
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Restoration_Intensity_by_site, y=Comp.1)) + geom_point()
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Impervious_By_Site, y=Comp.1)) + geom_point()
+
+```
+
+Honestly, the only thing that really jumps out is the dispersion varying with elevation. Like everything else.
+
+```{r test-resids-mod1p3-disp, echo=FALSE}
+
+mod1p3_disp <- glmmTMB(Comp.1 ~ Elevation + Restoration_Intensity_by_site + Impervious_By_Site, disp = ~Elevation,
+      data = van_hab_decomp_long)
+
+simulateResiduals(mod1p3_disp, plot=TRUE)
+
+
+```
+
+I don't feel great about not having the random effect, but this does improve the lefthand plot a lot. All quantiles still have deviations on the right though.
+
+Finally let's do some tests on TLDD itself.
+
+```{r TLDD-plots, echo=FALSE}
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Elevation, y=TLDD)) + geom_point()
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Restoration_Intensity_by_site, y=TLDD)) + geom_point()
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Impervious_By_Site, y=TLDD)) + geom_point()
+
+ggplot(data=van_hab_decomp_long_scaled, aes(x=Comp.1, y=TLDD)) + geom_point()
+
+```
+
+What if we do like the others and model dispersion with elevation:
+
+```{r test-resids-mod1p5-disp, echo=FALSE}
+
+mod1p5_disp <-  glmmTMB(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + 
+                          sampling_visit + Location, 
+                        disp = ~Elevation,
+         data=van_hab_decomp_long)
+
+simulateResiduals(mod1p5_disp, plot=TRUE)
+
+```
+
+Again, I don't feel great about leaving the random factor out, but this improves model fit a lot.
+
+## Implementing the better submodels in Pieceswise SEM 
+
+```{r piecewiseSEM-mod2-glmmTMB, echo=FALSE}
+
+# this is the model with the glmmTMB formulations we tested above
+
+mod_2_pSEM <- psem(
+  
+  glmmTMB(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+                      dispformula = ~Elevation, 
+      data = van_hab_decomp_long),
+  
+  glmmTMB(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),
+                  family="nbinom1",      
+       data = van_hab_decomp_long),
+  
+  glmmTMB(Comp.1 ~ Elevation + Restoration_Intensity_by_site + Impervious_By_Site, disp = ~Elevation,
+      data = van_hab_decomp_long),
+  
+  glmmTMB(TLDD ~ 
+            Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + sampling_visit + Location, 
+          disp = ~Elevation,
+          data = van_hab_decomp_long)
+)
+
+# coefs(mod_2_pSEM)
+
+# basisSet(mod_2_pSEM)
+
+# dSep(mod_2_pSEM, .progressBar = FALSE)
+
+summary(mod_2_pSEM)
+
+```
+
+After all that, the model summary will not run. According to a comment from Ben Bolker online, piecewiseSEM will not run glmmTMB models that do not include random effects, which is a weird issue. We could work around this either by adding random effects (even though the diagnostics showed that these fit worse):
+
+```{r piecewiseSEM-mod2-glmmTMB-2, echo=FALSE}
+
+# this is the model with the glmmTMB formulations we tested above
+
+mod_2.1_pSEM <- psem(
+  
+  glmmTMB(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+                      dispformula = ~Elevation, 
+      data = van_hab_decomp_long),
+  
+  glmmTMB(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),
+                  family="nbinom1",      
+       data = van_hab_decomp_long),
+  
+  glmmTMB(Comp.1 ~ Elevation + Restoration_Intensity_by_site + Impervious_By_Site + (1 | watershed), disp = ~Elevation,
+      data = van_hab_decomp_long),
+  
+  glmmTMB(TLDD ~ 
+            Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + sampling_visit + Location + (1 | watershed), 
+          disp = ~Elevation,
+          data = van_hab_decomp_long)
+)
+
+# coefs(mod_2_pSEM)
+
+# basisSet(mod_2_pSEM)
+
+# dSep(mod_2_pSEM, .progressBar = FALSE)
+
+summary(mod_2.1_pSEM)
+
+```
+
+This throws a bunch of warnings. Basically it cannot deal with using a different dispersion model, which is part of the whole point of using glmmTMB.
+
+So, as another option, let's try this again but not using glmmTMB. We will have to remove all the dispersion formulas. Depending on whether there was a random effect included in the best-fitting glmmTMB model according to the DHARMa tests, we could use either lmer or lm for the different sub-models, and we can use glmer to get the negative binomial for Restoration Intensity:
+
+```{r piecewiseSEM-lmer-complex, echo=FALSE}
+
+# this is the model which best estimates the glmmTMB structure using only lm() and lmer()
+
+mod_2_pSEM_2 <- psem(
+  
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+      data = van_hab_decomp_long),
+  
+  glmer.nb(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long),
+  
+  lm(Comp.1 ~ Elevation + Restoration_Intensity_by_site + Impervious_By_Site,
+      data = van_hab_decomp_long),
+  
+  lm(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + sampling_visit + Location, 
+          data = van_hab_decomp_long)
+)
+
+# coefs(mod_2_pSEM)
+
+# basisSet(mod_2_pSEM)
+
+# dSep(mod_2_pSEM, .progressBar = FALSE)
+
+summary(mod_2_pSEM_2)
+
+```
+
+Gives quite a lot of warnings, including that we need to scale the dataset. We can try that if we use only lmer and give up on using the negative binomial distribution for the restoration intensity model.
+
+```{r piecewiseSEM-lmer-simple, echo=FALSE}
+
+# this is the model with all lmer, no variation depending on the speficit model
+
+mod_2_pSEM_3 <- psem(
+  
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.1 ~ Elevation + Restoration_Intensity_by_site + Impervious_By_Site + (1|watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(TLDD ~ Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + August + R + (1 | watershed), 
+          data = van_hab_decomp_long_scaled)
+)
+
+# coefs(mod_2_pSEM)
+
+# basisSet(mod_2_pSEM)
+
+# dSep(mod_2_pSEM, .progressBar = FALSE)
+
+summary(mod_2_pSEM_3)
+
+```
+
+The above model allows us to use the scaled dataset, which does reduce AIC a lot. It does still give us some warnings through, including one about convergence.
+
+We could further reduce this by removing a couple insignificant paths. I removed the effect of impervious surface on Comp1. We could justify this that if there has been restoration, we expect that to annul the effects of impervious surface, so we doon't include both. I also removed sampling visit from the TLDD model. It does not appear significant and we could consider that because we are using TLDD which is temp-adjusted, that explains some of the seasonal variation which is due to temperature.
+
+However, I didn't remove Restoration Intensity from the TLDD model because that is what our whole main hypothesis is about! 
+
+# Supplemental results: SEM with Restoration Effort by Site (Fig S2)
+
+We can compare our main results to the results using our Restoration Effort metric:
+
+```{r rest-effort-partialSEM, echo=FALSE}
+
+mod_S2_pSEM <- psem(
+  
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(Restoration_Effort_by_site_full ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.1 ~ Elevation + Restoration_Effort_by_site_full + (1|watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(TLDD ~ Impervious_By_Site + Restoration_Effort_by_site_full + Elevation + Comp.1 + R  + (1 | Site), 
+          data = van_hab_decomp_long_scaled)
+)
+
+summary(mod_S2_pSEM)
+
+```
+
+This actually does yield some interesting differences from the restoration intensity model:
+
+1) There is no significant effect of impervious surface on restoration effort (!)
+2) There is a marginally significant effect of elevation on TLDD, which wasn't true in the main model.
+
+```{r S2-plot-SEM-partial, include=FALSE}
+
+# The plotting in the partialSEM package is quite ugly, 
+# and it's not possible to customize the layout. Therefore, we will plot it but not include this plot.
+
+plot(mod_S2_pSEM)
+
+```
+
+# Supplemental results: stream habitat focused restoration only
+
+We can also compare our main results to the results using our Restoration Effort metric:
+
+```{r hab-rest-partialSEM, echo=FALSE}
+
+mod_S3_pSEM <- psem(
+  
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(Restoration_Effort_by_site_habitat ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.1 ~ Elevation + Restoration_Effort_by_site_habitat + (1|watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(TLDD ~ Impervious_By_Site + Restoration_Effort_by_site_habitat + Elevation + Comp.1 + R  + (1 | Site), 
+          data = van_hab_decomp_long_scaled)
+)
+
+summary(mod_S3_pSEM)
+
+```
+
+There are some differences between the two restoration effort models - in this second one, the model explaining restoration effort fits much better, with a significant effect of impervious surface which wasn't true of the model that looked at all restoration effort. 
+
+```{r S3-plot-SEM-partial, include=FALSE}
+
+# The plotting in the partialSEM package is quite ugly, 
+# and it's not possible to customize the layout. Therefore, we will plot it but not include this plot.
+
+plot(mod_S3_pSEM)
+
+```
+
+# Supplemental results: TLND including an effect of temperature
+
+Finally, we can look at decomposition per day rather than per degree day:
+
+```{r TLND-partialSEM, echo=FALSE}
+
+# first we must scale the TLND data
+van_hab_decomp_long_scaled$TLDD <- as.vector(scale(van_hab_decomp_long_scaled$TLDD, TRUE, TRUE))
+
+# now:
+
+mod_S4_pSEM <- psem(
+  
+  lmer(Impervious_By_Site ~ Elevation + (1 | watershed ), 
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(degree_days ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation + (1 | watershed),      
+       data = van_hab_decomp_long_scaled),
+  
+  lmer(Comp.1 ~ Elevation + Restoration_Intensity_by_site + (1|watershed),
+      data = van_hab_decomp_long_scaled),
+  
+  lmer(TLND ~ degree_days + Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + R  + (1 | Site), 
+          data = van_hab_decomp_long_scaled)
+)
+
+summary(mod_S4_pSEM)
+
+```
+
+As expected, this model simply reveals the direct and indirect effects of elevation when temperature is no longer accounted for in the decomposition metric itself. The qualitative results otherwise change only minimally.
+
+```{r lavaan-model-S4, include=FALSE}
+
+# instead, we will plot the model output from lavaan and edit it to include the correct paths from partialSEM
+# because this way we can control the plot layout
+
+# first step is making the lavaan
+
+# new model structure
+mod.S4.SEM <- 'Impervious_By_Site ~  Elevation
+Restoration_Intensity_by_site ~ Impervious_By_Site + Elevation
+degree_days ~ Impervious_By_Site + Elevation
+Comp.1 ~ Elevation + Restoration_Intensity_by_site 
+TLND ~ degree_days + Impervious_By_Site + Restoration_Intensity_by_site + Elevation + Comp.1 + R'
+
+mod.S4.results <- sem(mod.S4.SEM, van_hab_decomp_long_scaled)
+
+summary(mod.S4.results, standardized=TRUE) # used 212 observations
+parameterEstimates(mod.S4.results, standardized = TRUE)
+fitMeasures(mod.S4.results, c("chisq", "pvalue", "rmsea", "rmsea.pvalue", "cfi", "srmr")) 
+# fits okay by CFI and SRMR, less well through Chi-Squared and RMSEA
+# this is probably good enough to use
+
+```
+
+``` {R get-layout-S4, include=FALSE}
+# define the layout for the SEM plot
+lay3 <- get_layout(NA, "Elevation", NA, "Impervious_By_Site", NA,
+                   "Comp.1", NA, "degree_days", NA, "Restoration_Intensity_by_site",
+                   NA, NA, "TLND", NA, NA,
+                   NA, NA, "R", NA, NA,
+                   rows=4)
+
+# now try to define the graph output and adjust some things
+sem_graph_output3 <- prepare_graph(model = mod.S4.results, layout = lay3) %>%
+  edit_graph({label_location = .25}) %>% # make it so labels don't overlap each other
+  linetype_pos_edges(1) %>% # positive paths are solid lines
+  linetype_neg_edges(2) %>% # negative paths are dashed lines
+  alpha_nonsig_edges(0.4) %>% # non-significant paths are grayed out (alpha is transparency)
+  hide_var() %>% # hide the variance of each variable
+  plot()
+
+sem_graph_output3
+# note: fixed the variable names up a bit in a vector editing program 
+
+```
